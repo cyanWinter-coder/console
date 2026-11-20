@@ -20,6 +20,8 @@
 package console
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -60,6 +62,30 @@ type Epoller struct {
 	mu        sync.Mutex
 	fdMapping map[int]*EpollConsole
 	closeOnce sync.Once
+	// closed is guarded by mu and records whether Close has run. Add and
+	// AddAll take mu so that a batch can never register against an epoll fd
+	// that Close is tearing down concurrently.
+	closed bool
+}
+
+// BatchError is returned by [Epoller.AddAll] when registering one of the
+// consoles in a batch fails. The whole batch is rolled back before it is
+// returned, so no console from the failed batch stays registered or visible
+// through the epoller.
+type BatchError struct {
+	// Index is the position, within the slice passed to AddAll, of the
+	// console whose registration failed.
+	Index int
+	// Err is the underlying error that caused the batch to fail.
+	Err error
+}
+
+func (e *BatchError) Error() string {
+	return fmt.Sprintf("failed to take over console at index %d: %v", e.Index, e.Err)
+}
+
+func (e *BatchError) Unwrap() error {
+	return e.Err
 }
 
 // NewEpoller returns an instance of epoller with a valid epoll fd.
@@ -78,7 +104,66 @@ func NewEpoller() (*Epoller, error) {
 // be registered with EPOLLET (i.e. using edge-triggered notification) and its
 // file descriptor will be set to non-blocking mode. After this, user should use
 // the return console to perform I/O.
+//
+// It is a single-element wrapper around [Epoller.AddAll] and keeps the same
+// behavior and error values as before.
 func (e *Epoller) Add(console Console) (*EpollConsole, error) {
+	consoles, err := e.AddAll([]Console{console})
+	if err != nil {
+		var berr *BatchError
+		if errors.As(err, &berr) {
+			// preserve the historical error surface of the single-console path
+			return nil, berr.Err
+		}
+		return nil, err
+	}
+	return consoles[0], nil
+}
+
+// AddAll takes over several consoles as one atomic batch. Every console is
+// switched to non-blocking mode and registered with EPOLLET, and none of them
+// becomes visible to [Epoller.Wait], [Epoller.CloseConsole] or another AddAll
+// until every registration and every index entry of the batch has succeeded.
+//
+// If any console fails, all consoles already registered as part of this batch
+// are unregistered and their index entries removed before the call returns.
+// The returned error is a [*BatchError] carrying the failing index and the
+// underlying error. AddAll never closes a console it was handed: ownership of
+// every console stays with the caller, including the consoles of a failed
+// batch, which remain open in non-blocking mode.
+func (e *Epoller) AddAll(consoles []Console) ([]*EpollConsole, error) {
+	if len(consoles) == 0 {
+		return []*EpollConsole{}, nil
+	}
+
+	epollConsoles := make([]*EpollConsole, len(consoles))
+	// registered tracks the entries that this batch has published; on failure
+	// it is exactly the set that must be undone.
+	registered := make(map[int]struct{}, len(consoles))
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed {
+		return nil, os.ErrClosed
+	}
+
+	for i, console := range consoles {
+		epollConsole, err := e.addLocked(console)
+		if err != nil {
+			e.rollbackLocked(registered)
+			return nil, &BatchError{Index: i, Err: err}
+		}
+		epollConsoles[i] = epollConsole
+		registered[epollConsole.sysfd] = struct{}{}
+	}
+	return epollConsoles, nil
+}
+
+// addLocked registers one console and publishes its index entry. The caller
+// must hold e.mu, which keeps the entry invisible to Wait and CloseConsole
+// until the whole batch is committed.
+func (e *Epoller) addLocked(console Console) (*EpollConsole, error) {
 	sysfd := int(console.Fd())
 	// Set sysfd to non-blocking mode
 	if err := unix.SetNonblock(sysfd, true); err != nil {
@@ -98,10 +183,22 @@ func (e *Epoller) Add(console Console) (*EpollConsole, error) {
 		readc:   sync.NewCond(&sync.Mutex{}),
 		writec:  sync.NewCond(&sync.Mutex{}),
 	}
-	e.mu.Lock()
+	// Publishing only happens while mu is held, so a failed batch rolls back
+	// before any concurrent reader can observe a half-initialized mapping.
 	e.fdMapping[sysfd] = ef
-	e.mu.Unlock()
 	return ef, nil
+}
+
+// rollbackLocked undoes every registration published by the in-flight batch.
+// The caller must hold e.mu. The epoll fd is still open and valid (Close is
+// serialized on the same lock) and each listed fd was registered successfully
+// moments ago, so EPOLL_CTL_DEL cannot fail in practice; the index entry is
+// removed regardless so the mapping can never retain an orphan.
+func (e *Epoller) rollbackLocked(registered map[int]struct{}) {
+	for sysfd := range registered {
+		delete(e.fdMapping, sysfd)
+		_ = unix.EpollCtl(e.efd, unix.EPOLL_CTL_DEL, sysfd, &unix.EpollEvent{})
+	}
 }
 
 // Wait starts the loop to wait for its consoles' notifications and signal
@@ -136,11 +233,18 @@ func (e *Epoller) Wait() error {
 	}
 }
 
-// CloseConsole unregisters the console's file descriptor from epoll interface
+// CloseConsole unregisters the console's file descriptor from epoll interface.
+// It is serialized with [Epoller.AddAll] and [Epoller.Close] by e.mu, so it
+// can only ever observe a fully committed batch, never a half-initialized one.
 func (e *Epoller) CloseConsole(fd int) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.fdMapping, fd)
+	if e.closed {
+		// The epoll fd itself is gone; the index entry above was the only
+		// remaining state to clean up.
+		return nil
+	}
 	return unix.EpollCtl(e.efd, unix.EPOLL_CTL_DEL, fd, &unix.EpollEvent{})
 }
 
@@ -151,11 +255,16 @@ func (e *Epoller) getConsole(sysfd int) *EpollConsole {
 	return f
 }
 
-// Close closes the epoll fd
+// Close closes the epoll fd. It takes the same lock as AddAll so that a batch
+// in flight either finishes completely before the epoll fd is closed, or fails
+// with [os.ErrClosed] without touching the closed fd.
 func (e *Epoller) Close() error {
 	closeErr := os.ErrClosed // default to "file already closed"
 	e.closeOnce.Do(func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
 		closeErr = unix.Close(e.efd)
+		e.closed = true
 	})
 	return closeErr
 }
